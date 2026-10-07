@@ -12,7 +12,14 @@ ctx.configure({ device, format, alphaMode: 'opaque' });
 console.log('WebGPU ready:', format);
 
 const SHADER = `
-  struct U {time: f32, aspect: f32, mouse: vec2f};
+  // Byte offsets: time 0, padding 4, canvasSize 8, mouse 16, padding 24.
+  struct U {
+    time: f32,
+    pad: f32,
+    canvasSize: vec2f,
+    mouse: vec2f,
+    padEnd: vec2f,
+  };
   @group(0) @binding(0) var<uniform> u: U;
 
   struct VSOut {
@@ -23,7 +30,7 @@ const SHADER = `
 
   @vertex fn vs(@builtin(vertex_index) i: u32)
        -> VSOut {
-    var p = array<vec2f, 6>(
+    var positions = array<vec2f, 6>(
       vec2f(-0.5, -0.5),
       vec2f( 0.5, -0.5),
       vec2f( 0.5,  0.5),
@@ -40,12 +47,30 @@ const SHADER = `
       vec3f(1.0, 1.0, 0.0));
 
       let a = u.time;
-      let q = vec2f(p[i].x * cos(a) - p[i].y * sin(a),
-                     p[i].x * sin(a) + p[i].y * cos(a));
-      
+      // WGSL matrix arguments fill columns, not rows.
+      let R = mat2x2f(
+         cos(a), sin(a),
+        -sin(a), cos(a)
+      );
+      let S = mat2x2f(
+        1.5, 0.0,
+        0.0, 0.6
+      );
+
+      var p = positions[i];
+      // Lab experiments: keep exactly ONE of these four lines active.
+      p = R * p;              // normal rotation (default)
+      // p = R * S * p;       // scale first, then rotate
+      // p = S * R * p;       // rotate first, then scale
+      // p = transpose(R) * p; // opposite rotation
+
+      // Correct for the current canvas dimensions after the local transform.
+      p.x *= u.canvasSize.y / u.canvasSize.x;
+      // Translate last so rotation stays around the square's own center.
+      p += u.mouse;
 
       var out: VSOut;
-      out.pos = vec4f(q / vec2f(u.aspect, 1.0) + u.mouse, 0.0, 1.0);
+      out.pos = vec4f(p, 0.0, 1.0);
       out.colour = vec4f(c[i], 1.0);
       return out;
   }
@@ -63,7 +88,7 @@ const pipeline = device.createRenderPipeline({
 
 
 const ubuf = device.createBuffer({
-  size: 16,
+  size: 32,
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 });
 
@@ -72,14 +97,16 @@ const bind = device.createBindGroup({
   entries: [{ binding: 0, resource: { buffer: ubuf } }]
 });
 
-const uniformData = new Float32Array(4);
+// Match U: [time, padding, width, height, mouseX, mouseY, padding, padding].
+// vec2f fields start on 8-byte boundaries; the buffer totals 32 bytes.
+const uniformData = new Float32Array(8);
 
 canvas.addEventListener('pointermove', (event) => {
   const r = canvas.getBoundingClientRect();
   if (!r.width || !r.height) return;
   // Convert canvas coordinates to clip space, where positive Y points up.
-  uniformData[2] = 2 * (event.clientX - r.left) / r.width - 1;
-  uniformData[3] = 1 - 2 * (event.clientY - r.top) / r.height;
+  uniformData[4] = 2 * (event.clientX - r.left) / r.width - 1;
+  uniformData[5] = 1 - 2 * (event.clientY - r.top) / r.height;
 });
 
 const t0 = performance.now();
@@ -87,10 +114,11 @@ const t0 = performance.now();
 function resize() {
   const dpr = Math.min(2, window.devicePixelRatio || 1);
   const r = canvas.getBoundingClientRect();
-  canvas.width = Math.round(r.width * dpr);
-  canvas.height = Math.round(r.height * dpr);
+  canvas.width = Math.max(1, Math.round(r.width * dpr));
+  canvas.height = Math.max(1, Math.round(r.height * dpr));
 }
 window.addEventListener('resize', resize);
+new ResizeObserver(resize).observe(canvas);
 resize();
 
 function frame() {
@@ -98,7 +126,8 @@ function frame() {
   const t = (performance.now() - t0) * 0.001;
 
   uniformData[0] = t;
-  uniformData[1] = canvas.width / canvas.height;
+  uniformData[2] = canvas.width;
+  uniformData[3] = canvas.height;
   device.queue.writeBuffer(ubuf, 0, uniformData);
 
   const enc = device.createCommandEncoder();
